@@ -36,3 +36,5 @@ class RebookingState(TypedDict, total=False):
     escalated: bool
     escalation_note: str
     final_response: str
+    seat_preference: str
+    supervisor_decision: str

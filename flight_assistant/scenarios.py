@@ -11,16 +11,21 @@ import sys
 from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.errors import GraphInterrupt
+from langgraph.types import Command
 
-from flight_assistant.graph import build_graph
+from flight_assistant.graph import build_graph, sqlite_checkpointer
+from flight_assistant.stats import format_summary, summarize
 
 NODE_NAMES = {
     "classifier",
+    "clarify",
     "rebooking",
     "tools",
     "refund",
     "compensation",
     "policy_checker",
+    "supervisor",
     "escalation",
     "final_response",
 }
@@ -154,6 +159,25 @@ def problems_for(turn: Turn, path: list[str], state: dict) -> list[str]:
     return problems
 
 
+def resume_value(interrupt_value):
+    """The batch runner answers pauses so the core scenarios still finish."""
+    if isinstance(interrupt_value, dict) and interrupt_value.get("kind") == "clarify":
+        return "The next available flight is fine."
+    return {"approved": True}
+
+
+def _extend_path(path: list[str], update: dict) -> None:
+    path.extend(name for name in update if name in NODE_NAMES)
+
+
+def _stream_until_pause(graph, payload, config, path: list[str]) -> None:
+    try:
+        for update in graph.stream(payload, config, stream_mode="updates"):
+            _extend_path(path, update)
+    except GraphInterrupt:
+        return
+
+
 def invoke_turn(graph, turn: Turn) -> tuple[list[str], dict]:
     payload: dict = {"messages": [HumanMessage(content=turn.message)]}
     if turn.send_booking:
@@ -161,8 +185,13 @@ def invoke_turn(graph, turn: Turn) -> tuple[list[str], dict]:
         payload["booking_ref"] = turn.booking_ref
     config = {"configurable": {"thread_id": turn.thread_id}, "recursion_limit": 60}
     path: list[str] = []
-    for update in graph.stream(payload, config, stream_mode="updates"):
-        path.extend(name for name in update if name in NODE_NAMES)
+    _stream_until_pause(graph, payload, config, path)
+    for _ in range(4):
+        snapshot = graph.get_state(config)
+        if not snapshot.next:
+            break
+        pending = snapshot.interrupts[0].value if snapshot.interrupts else None
+        _stream_until_pause(graph, Command(resume=resume_value(pending)), config, path)
     state = dict(graph.get_state(config).values)
     return path, state
 
@@ -264,11 +293,12 @@ def render(diagram: str, results: list[dict]) -> str:
             parts.append("")
         else:
             parts.extend(["Path check: matched the expected route.", ""])
+    parts.extend(["", format_summary(summarize(results)), ""])
     return "\n".join(parts).rstrip() + "\n"
 
 
 def main() -> int:
-    graph = build_graph()
+    graph = build_graph(checkpointer=sqlite_checkpointer())
     diagram = graph.get_graph().draw_mermaid()
     results = run_all(graph)
     text = render(diagram, results)

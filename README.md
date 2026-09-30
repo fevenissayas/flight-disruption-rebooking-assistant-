@@ -16,12 +16,13 @@ The desk clock is fixed at **2026-09-29T12:00:00+00:00**, so "tomorrow noon" is 
 
 ## Graph
 
-Eight nodes, three conditional routers, and one retry cycle. Solid arrows always run. Dashed arrows are conditional.
+Ten nodes, four conditional routers, and one retry cycle. Solid arrows always run. Dashed arrows are conditional.
 
 ```mermaid
 flowchart TD
     startNode([start]) --> classifier
-    classifier -->|rebook| rebooking
+    classifier -->|rebook| clarify
+    clarify --> rebooking
     classifier -->|refund| refund
     classifier -->|compensation| compensation
     classifier -->|complaint| escalation
@@ -30,7 +31,10 @@ flowchart TD
     rebooking -->|model stopped calling tools| policy_checker
     refund --> policy_checker
     compensation --> policy_checker
-    policy_checker -->|pass| final_response
+    policy_checker -->|pass under 300| final_response
+    policy_checker -->|pass over 300| supervisor
+    supervisor -->|approved| final_response
+    supervisor -->|declined| escalation
     policy_checker -->|fail and retries remain| rebooking
     policy_checker -->|fail and retries remain| refund
     policy_checker -->|fail and retries remain| compensation
@@ -45,12 +49,14 @@ flowchart TD
 
 | Node | Responsibility |
 | --- | --- |
-| `classifier` | Structured output: `rebook`, `refund`, `compensation`, or `complaint`, plus any deadline. Starts a new attempt. |
+| `classifier` | Structured output: `rebook`, `refund`, `compensation`, or `complaint`, plus any deadline. Starts a new attempt and loads any saved seat preference. |
+| `clarify` | For a rebooking with no deadline, pauses with `interrupt()` and asks when the passenger needs to arrive. |
 | `rebooking` | Tool-calling model. Chooses `get_booking` and `search_flights`, then proposes one flight number from the results. |
 | `tools` | `ToolNode` executes the tool calls and appends the results to the message history. |
 | `refund` | Reads the booking and fare rules, then proposes a refund amount. |
 | `compensation` | Reads the booking and the delay, then proposes a compensation amount. |
 | `policy_checker` | Plain Python. Accepts or rejects the proposal and records the reason. No model call. |
+| `supervisor` | Pauses with `interrupt()` when a refund or compensation over $300 passed policy. |
 | `escalation` | Writes a handover note: the request, what was tried, and why it stopped. |
 | `final_response` | Writes the passenger reply: what was arranged, the next step, and whether a person will follow up. |
 
@@ -76,9 +82,10 @@ The classifier is the start of every turn, including a follow-up. It keeps the b
 
 ## Routing
 
-1. **After the classifier.** `rebook`, `refund`, and `compensation` go to their agents. `complaint` goes straight to escalation.
+1. **After the classifier.** `rebook` goes to `clarify`, then the rebooking agent. `refund` and `compensation` go to their agents. `complaint` goes straight to escalation.
 2. **After rebooking.** `tools_condition` sends tool calls to `tools`, which always returns to `rebooking`. A reply with no tool call goes to the policy checker. A cap of four tool results on the same attempt forces a proposal so this loop cannot run forever.
-3. **After the policy checker.** A pass goes to the final response. A failure increments `retry_count` and returns to `solution_source` (`rebooking`, `refund`, or `compensation`) with the reason on the message list. At `retry_count == 3` (the original try plus two retries) the case goes to escalation, then the final response.
+3. **After the policy checker.** A pass under $300 goes to the final response. A refund or compensation over $300 goes to the supervisor. A failure increments `retry_count` and returns to `solution_source` (`rebooking`, `refund`, or `compensation`) with the reason on the message list. At `retry_count == 3` (the original try plus two retries) the case goes to escalation, then the final response.
+4. **After the supervisor.** An approval goes to the final response. A decline goes to escalation.
 
 The retry cycle is `specialist → policy_checker → specialist`. The counter is what guarantees it ends.
 
@@ -113,16 +120,24 @@ All three are mocks. They return the same JSON on every run.
 
 ## Checkpointer
 
-The graph is compiled with `MemorySaver`. Every `invoke` / `stream` call passes `configurable.thread_id`. Scenario 1 and the follow-up share `passenger-xk9l2p`. The follow-up input is only the new message. The booking reference, booking, and earlier messages stay in the checkpoint, so the refund agent does not ask for the reference again.
+Every `invoke` / `stream` call passes `configurable.thread_id`. Scenario 1 and the follow-up share `passenger-xk9l2p`. The follow-up input is only the new message. The booking reference, booking, and earlier messages stay in the checkpoint, so the refund agent does not ask for the reference again.
 
-`MemorySaver` lives in the process. One run of the scenario command is one process, which is enough for the follow-up.
+`python -m flight_assistant.scenarios` compiles the graph with `SqliteSaver` and writes `checkpoints.sqlite`. A later process that opens the same file can load that thread. Tests use `MemorySaver` so each run starts empty. Delete `checkpoints.sqlite` to reset the saved desk.
+
+## Bonus behavior
+
+- A rebooking with no deadline and no phrase such as "next flight" pauses with `interrupt()` and asks what time the passenger needs to arrive.
+- A refund or compensation over $300 pauses with `interrupt()` until a supervisor approves. The scenario command approves so those turns still finish. A decline goes to escalation.
+- A LangGraph store remembers an aisle or window request under the booking reference and loads it on a later thread.
+- `search_flights` fans out with `Send`, one branch per airline, and merges the lists.
+- The scenario report prints rebooking success rate, escalation rate, and requests by intent.
 
 ## Scenarios
 
 | # | Message | Expected path |
 | --- | --- | --- |
 | 1 | Cancelled flight, in Dubai by tomorrow noon | Classifier → Rebooking ⇄ Tools → Policy checker (pass) → Final response. Flight `EK202`. |
-| 1b | "Actually, can I get a refund instead?" on the same thread | Classifier → Refund → Policy checker (pass) → Final response. Full fare 850. |
+| 1b | "Actually, can I get a refund instead?" on the same thread | Classifier → Refund → Policy checker (pass) → Supervisor approves the $850 refund → Final response. |
 | 2 | Delayed 6 hours, asking about entitlement | Classifier → Compensation → Policy checker (pass) → Final response. Amount 200. |
 | 3 | Rebook when only business class exists | Classifier → Rebooking ⇄ Policy checker, three failures → Escalation → Final response. |
 | 4 | Third cancellation, wants a manager | Classifier → Escalation → Final response. |

@@ -22,11 +22,12 @@ Set latest_arrival to an ISO 8601 time when the passenger gives a deadline, othe
 """
 
 
-def rebooking_system(booking_ref: str, constraints: str) -> str:
+def rebooking_system(booking_ref: str, constraints: str, seat: str = "") -> str:
+    seat_line = f"\nThe passenger prefers a {seat} seat. Keep that in mind.\n" if seat else ""
     return f"""You are the rebooking agent. The booking reference is {booking_ref}.
 It is already known. Never ask the passenger for it.
 Current time: {REFERENCE_NOW_ISO}.
-Passenger constraints: {constraints}.
+Passenger constraints: {constraints}.{seat_line}
 
 Call tools in this order, and stop once both results are in the conversation:
 1. If get_booking has not been called, call it with booking_ref "{booking_ref}".

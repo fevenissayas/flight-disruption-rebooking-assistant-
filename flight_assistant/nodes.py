@@ -4,6 +4,9 @@ import json
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from langgraph.store.base import BaseStore
+from langgraph.types import interrupt
+
 from flight_assistant.llm import get_llm
 from flight_assistant.policy import MAX_POLICY_ATTEMPTS, evaluate_policy
 from flight_assistant.prompts import (
@@ -26,6 +29,8 @@ from flight_assistant.state import RESET_ATTEMPTS, RebookingState
 from flight_assistant.tools import REBOOKING_TOOLS, get_booking, get_fare_rules
 
 MAX_TOOL_RESULTS = 4
+APPROVAL_LIMIT = 300.0
+_CLEAR_HINTS = ("next", "earliest", "soon", "any flight", "first flight", "noon", "morning", "tonight")
 
 
 def _text(message) -> str:
@@ -110,19 +115,63 @@ def _end_on_user(messages: list) -> list:
     return messages
 
 
-def classifier(state: RebookingState) -> dict:
+def _mentioned_seat(text: str) -> str:
+    lowered = text.lower()
+    if "aisle" in lowered:
+        return "aisle"
+    if "window" in lowered:
+        return "window"
+    return ""
+
+
+def _remember_seat(store: BaseStore, booking_ref: str, text: str) -> str:
+    mentioned = _mentioned_seat(text)
+    if not booking_ref:
+        return mentioned
+    if mentioned:
+        store.put(("passenger", booking_ref), "seat", {"seat": mentioned})
+        return mentioned
+    saved = store.get(("passenger", booking_ref), "seat")
+    if saved is None:
+        return ""
+    return str((saved.value or {}).get("seat") or "")
+
+
+def constraints_are_clear(state: RebookingState) -> bool:
+    constraints = state.get("constraints") or {}
+    if constraints.get("latest_arrival"):
+        return True
+    text = f"{constraints.get('notes') or ''} {state.get('passenger_request') or ''}".lower()
+    return any(hint in text for hint in _CLEAR_HINTS)
+
+
+def needs_supervisor(state: RebookingState) -> bool:
+    if not (state.get("policy_checked") and state.get("policy_passed")):
+        return False
+    solution = state.get("proposed_solution") or {}
+    if solution.get("type") not in {"refund", "compensation"}:
+        return False
+    try:
+        return float(solution.get("amount")) > APPROVAL_LIMIT
+    except (TypeError, ValueError):
+        return False
+
+
+def classifier(state: RebookingState, store: BaseStore) -> dict:
     """Read the latest passenger message and set intent plus constraints."""
     messages = state.get("messages", [])
     classification = get_llm().with_structured_output(Classification).invoke(
         [SystemMessage(content=classifier_system()), *_conversation(messages)]
     )
+    passenger_request = _passenger_text(messages)
     return {
         "intent": classification.intent,
         "constraints": {
             "latest_arrival": classification.latest_arrival,
             "notes": classification.notes,
         },
-        "passenger_request": _passenger_text(messages),
+        "passenger_request": passenger_request,
+        "seat_preference": _remember_seat(store, state.get("booking_ref", ""), passenger_request),
         "retry_count": 0,
         "policy_checked": False,
         "policy_passed": False,
@@ -135,6 +184,21 @@ def classifier(state: RebookingState) -> dict:
         "attempts": RESET_ATTEMPTS,
         "messages": [AIMessage(content=f"Classified intent: {classification.intent}.")],
     }
+
+
+def clarify(state: RebookingState) -> dict:
+    """Ask for a deadline before searching when a rebooking request has none."""
+    if state.get("intent") != "rebook" or constraints_are_clear(state):
+        return {}
+    answer = interrupt(
+        {
+            "kind": "clarify",
+            "question": "What time do you need to arrive? I will search after you answer.",
+        }
+    )
+    constraints = dict(state.get("constraints") or {})
+    constraints["notes"] = str(answer)
+    return {"constraints": constraints}
 
 
 def rebooking_agent(state: RebookingState) -> dict:
@@ -153,7 +217,13 @@ def rebooking_agent(state: RebookingState) -> dict:
     constraints = _json(state.get("constraints") or {})
     response = get_llm().bind_tools(REBOOKING_TOOLS).invoke(
         [
-            SystemMessage(content=rebooking_system(state.get("booking_ref", ""), constraints)),
+            SystemMessage(
+                content=rebooking_system(
+                    state.get("booking_ref", ""),
+                    constraints,
+                    state.get("seat_preference", ""),
+                )
+            ),
             *_end_on_user(messages),
         ]
     )
@@ -306,6 +376,34 @@ def policy_checker(state: RebookingState) -> dict:
             )
         ]
     return update
+
+
+def supervisor(state: RebookingState) -> dict:
+    """Pause for approval when a refund or compensation is over $300."""
+    solution = state.get("proposed_solution") or {}
+    amount = solution.get("amount")
+    decision = interrupt(
+        {
+            "kind": "approval",
+            "intent": state.get("intent"),
+            "amount": amount,
+            "question": f"Approve this {state.get('intent')} of {amount}?",
+        }
+    )
+    approved = False
+    if isinstance(decision, dict):
+        approved = bool(decision.get("approved"))
+    elif isinstance(decision, bool):
+        approved = decision
+    elif isinstance(decision, str):
+        approved = decision.strip().lower() in {"y", "yes", "approve", "approved"}
+    if approved:
+        return {"supervisor_decision": "approved"}
+    return {
+        "supervisor_decision": "declined",
+        "escalated": True,
+        "escalation_note": f"Supervisor declined the {state.get('intent')} of {amount}.",
+    }
 
 
 def escalation_agent(state: RebookingState) -> dict:
