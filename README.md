@@ -6,7 +6,7 @@ A passenger whose flight was cancelled or delayed sends a message. A LangGraph w
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # set OPENAI_API_KEY
+cp .env.example .env   # set GEMINI_API_KEY
 python -m flight_assistant.scenarios
 ```
 
