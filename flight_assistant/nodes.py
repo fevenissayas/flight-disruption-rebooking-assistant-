@@ -100,6 +100,16 @@ def _json(value) -> str:
     return json.dumps(value, indent=2)
 
 
+def _end_on_user(messages: list) -> list:
+    """Keep the request ending on a user turn. Some providers reject a trailing assistant message."""
+    if messages and isinstance(messages[-1], AIMessage):
+        return [
+            *messages,
+            HumanMessage(content="Continue. Call a tool if booking or flight data is still missing."),
+        ]
+    return messages
+
+
 def classifier(state: RebookingState) -> dict:
     """Read the latest passenger message and set intent plus constraints."""
     messages = state.get("messages", [])
@@ -144,7 +154,7 @@ def rebooking_agent(state: RebookingState) -> dict:
     response = get_llm().bind_tools(REBOOKING_TOOLS).invoke(
         [
             SystemMessage(content=rebooking_system(state.get("booking_ref", ""), constraints)),
-            *messages,
+            *_end_on_user(messages),
         ]
     )
     if response.tool_calls and not over_cap:
