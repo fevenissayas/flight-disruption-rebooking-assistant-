@@ -4,7 +4,7 @@ import json
 
 from langchain_core.tools import tool
 
-from flight_assistant.data import BOOKINGS, FARE_RULES, FLIGHTS, normalize_place
+from flight_assistant.data import BOOKINGS, FARE_RULES
 
 
 def lookup_booking(booking_ref: str) -> dict:
@@ -15,12 +15,12 @@ def lookup_booking(booking_ref: str) -> dict:
 
 
 def lookup_flights(origin: str, destination: str, date: str) -> list[dict]:
-    key = (normalize_place(origin), normalize_place(destination))
-    flights = FLIGHTS.get(key, [])
     # The date is accepted so the agent can call the tool naturally.
     # The schedule itself is fixed so each scenario is repeatable.
     _ = date
-    return flights
+    from flight_assistant.parallel import parallel_search
+
+    return parallel_search(origin, destination)
 
 
 def lookup_fare_rules(fare_type: str) -> dict:
